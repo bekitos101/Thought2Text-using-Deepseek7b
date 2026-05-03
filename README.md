@@ -1,6 +1,16 @@
-# Thought2Text: Text Generation from EEG Signal using Large Language Models (LLMs)
+# Thought2Text — DeepSeek-7B Extension
 
-Paper Link: https://arxiv.org/pdf/2410.07507v1 
+## Purpose
+
+This repository extends the original **Thought2Text** framework by replacing the LLM backbone with **DeepSeek-LLM-7B-Chat**. The goal is to evaluate whether DeepSeek-7B, an open-source model with strong reasoning capabilities, can match or outperform the LLaMA-v3, Mistral-v0.3, and Qwen2.5 baselines from the original paper when fine-tuned on EEG embeddings for brain-to-text generation.
+
+The experiment follows the same three-stage training pipeline (EEG encoder pre-training → multimodal LLM fine-tuning → EEG-grounded inference) and is evaluated on the same public EEG dataset collected from six subjects under image stimuli.
+
+---
+
+## Original Paper
+
+Paper Link: https://arxiv.org/pdf/2410.07507v1
 
 **Abstract**: Decoding and expressing brain activity  in a comprehensible form is a challenging frontier in AI. This paper presents \textit{Thought2Text}, which uses instruction-tuned Large Language Models (LLMs) fine-tuned with EEG data to achieve this goal. The approach involves three stages: (1) training an EEG encoder for visual feature extraction, (2) fine-tuning LLMs on image and text data, enabling multimodal description generation, and (3) further fine-tuning on EEG embeddings to generate text directly from EEG during inference. Experiments on a public EEG dataset collected for six subjects with image stimuli demonstrate the efficacy of multimodal LLMs (LLaMa-v3, Mistral-v0.3, Qwen2.5), validated using traditional language generation evaluation metrics, GPT-4 based assessments, and evaluations by human expert. This approach marks a significant advancement towards portable, low-cost "thoughts-to-text" technology with potential applications in both neuroscience and natural language processing (NLP).
 
@@ -74,4 +84,14 @@ The EEG Encoder portion of our approach is based on the following paper and the 
 
 - S. Palazzo, C. Spampinato, I. Kavasidis, D. Giordano, J. Schmidt, M. Shah, Decoding Brain Representations by Multimodal Learning of Neural Activity and Visual Features, IEEE TRANSACTIONS ON PATTERN ANALYSIS AND MACHINE INTELLIGENCE, 2020, doi: 10.1109/TPAMI.2020.2995909
 
-For any questions or concerns, contact [Abhijit](mailto:abhijitmishra.530@gmail.com) or [Shreya](mailto:shreya.shukla@utexas.edu). Pull requests and GitHub issues may not be entertained in time. If you use our work, please cite it.  
+For any questions or concerns about the original work, contact [Abhijit](mailto:abhijitmishra.530@gmail.com) or [Shreya](mailto:shreya.shukla@utexas.edu).
+
+---
+
+## Acknowledgements
+
+This work builds on the excellent work of **Abhijit Mishra** and **Shreya Shukla**, authors of the original Thought2Text framework. Their three-stage EEG-to-text pipeline, codebase, and dataset made this extension possible. Please cite their paper if you use any part of this work:
+
+> Abhijit Mishra, Shreya Shukla. *Thought2Text: Text Generation from EEG Signal using Large Language Models (LLMs).* arXiv:2410.07507, 2024. https://arxiv.org/abs/2410.07507
+
+Original repository: https://github.com/abhijitmishra/Thought2Text
