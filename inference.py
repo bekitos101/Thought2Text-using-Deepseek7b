@@ -103,11 +103,23 @@ def main():
 
         
 
+    # read injection config from the loaded model
+    injection_layer = getattr(model.config, "injection_layer", 0)
+    token_inject    = getattr(model, "token_inject", False)
+
     for batch in tqdm(test_dataloader):
         eeg, label_string, caption_raw, image_path = batch
         eeg = eeg.to(args.device)
+
+        # original path: always needed for cls_logits → predicted label string
         emb_out, cls_out = model.eeg_encoder(eeg)
         preds = softmax(cls_out).argmax(dim=1)
+
+        if token_inject:
+            # temporal token path: (B, 10, 50) for mid-layer injection
+            mm_embeds = model.eeg_encoder(eeg, return_tokens=True)
+        else:
+            mm_embeds = emb_out
 
         pred_label_strings = []
         for p in preds:
@@ -156,10 +168,11 @@ def main():
         output_ids, labels_gen = model.generate(
             input_ids1=batched_input_ids1,
             input_ids2=batched_input_ids2,
-            mm_embeds=emb_out,
-            do_sample = False,
+            mm_embeds=mm_embeds,
+            injection_layer=injection_layer,
+            do_sample=False,
             max_new_tokens=max_len,
-            repetition_penalty=1.1
+            repetition_penalty=1.1,
         )
         output_text = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
 

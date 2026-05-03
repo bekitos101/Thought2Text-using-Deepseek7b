@@ -101,11 +101,12 @@ class Stage2Trainer(Trainer):
 
 
 class Stage3Trainer(Trainer):
-    def __init__(self, data_loaders=None, tokenizer=None, **kwargs):
+    def __init__(self, data_loaders=None, tokenizer=None, injection_layer=0, **kwargs):
         super().__init__(**kwargs)
         self.data_loaders = data_loaders
         self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
         self.tokenizer = tokenizer
+        self.injection_layer = injection_layer
 
     def compute_loss(self, model, inputs, return_outputs=False):
         (
@@ -117,7 +118,8 @@ class Stage3Trainer(Trainer):
         #input_ids1 = input_ids1.to(self.device)
         #input_ids2 = input_ids2.to(self.device)
         output, labels = model(
-            input_ids1=input_ids1, input_ids2=input_ids2, mm_embeds=eeg_data
+            input_ids1=input_ids1, input_ids2=input_ids2, mm_embeds=eeg_data,
+            injection_layer=self.injection_layer,
         )
         # print("Labels", self.tokenizer.batch_decode(labels))
         return (output.loss, output) if return_outputs else output.loss
@@ -144,6 +146,8 @@ def main():
             eeg_encoder_path=args.eeg_encoder_path,
             llm_path=args.llm_backbone_name_or_path,
             use_lora=args.use_lora,
+            token_inject=args.token_inject,
+            injection_layer=args.injection_layer,
             llm_quantization_config=quantization_config,
             llm_low_cpu_mem_usage=True,
         )
@@ -157,6 +161,8 @@ def main():
             eeg_encoder_path=args.eeg_encoder_path,
             llm_path=args.llm_backbone_name_or_path,
             use_lora=args.use_lora,
+            token_inject=args.token_inject,
+            injection_layer=args.injection_layer,
             llm_low_cpu_mem_usage=True,
         )
         model.eeg_encoder.to(args.device)
@@ -287,12 +293,17 @@ def main():
     
     loaders = {
             split: DataLoader(
-                Filter(SplitterFineTuning(
-                    dataset,
-                    split_path=args.splits_path,
-                    split_num=args.split_num,
-                    split_name=split,
-                ),eeg_encoder = model.eeg_encoder, device = args.device),
+                Filter(
+                    SplitterFineTuning(
+                        dataset,
+                        split_path=args.splits_path,
+                        split_num=args.split_num,
+                        split_name=split,
+                    ),
+                    eeg_encoder=model.eeg_encoder,
+                    device=args.device,
+                    token_inject=args.token_inject,
+                ),
                 batch_size=args.batch_size,
                 drop_last=True,
                 shuffle=True,
@@ -329,6 +340,7 @@ def main():
         eval_dataset=dataset,
         data_loaders=loaders,
         tokenizer=dataset.tokenizer,
+        injection_layer=args.injection_layer,
     )
     trainer.train()
     model.save_pretrained(args.output)

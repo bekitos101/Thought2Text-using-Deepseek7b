@@ -48,6 +48,10 @@ class EEGModelForCausalLMConfig(PretrainedConfig):
     is_composition = True
 
     def __init__(self, **kwargs):
+        # pop before super().__init__ so PretrainedConfig doesn't see unknown keys
+        injection_layer = kwargs.pop("injection_layer", 0)
+        token_inject    = kwargs.pop("token_inject", False)
+
         super().__init__(**kwargs)
         if "eeg_encoder" not in kwargs or "llm" not in kwargs:
             raise ValueError(
@@ -58,17 +62,25 @@ class EEGModelForCausalLMConfig(PretrainedConfig):
         llm_config = kwargs.pop("llm")
         llm_model_type = llm_config.pop("model_type")
 
-        self.eeg_encoder = EEGEncoderConfig(**eeg_encoder_config)
-        self.llm = AutoConfig.for_model(llm_model_type, **llm_config)
+        self.eeg_encoder    = EEGEncoderConfig(**eeg_encoder_config)
+        self.llm            = AutoConfig.for_model(llm_model_type, **llm_config)
+        self.injection_layer = injection_layer
+        self.token_inject    = token_inject
 
     @classmethod
     def from_separate_configs(
         cls,
         eeg_encoder_config: PretrainedConfig,
         llm_config: PretrainedConfig,
+        injection_layer: int = 0,
+        token_inject: bool = False,
         **kwargs,
     ) -> PretrainedConfig:
 
         return cls(
-            eeg_encoder=eeg_encoder_config.to_dict(), llm=llm_config.to_dict(), **kwargs
+            eeg_encoder=eeg_encoder_config.to_dict(),
+            llm=llm_config.to_dict(),
+            injection_layer=injection_layer,
+            token_inject=token_inject,
+            **kwargs,
         )

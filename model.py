@@ -104,6 +104,43 @@ class EEGModelForCausalLM(PreTrainedModel):
     def get_llm(self):
         return self.llm
 
+    def _get_layers(self):
+        """Return the transformer block list for any supported model family."""
+        try:
+            # LLaMA / DeepSeek / Qwen / Mistral
+            lm = self.llm.model.model if self.use_lora else self.llm.model
+            return lm.layers
+        except AttributeError:
+            # OPT
+            dec = self.llm.model.model.decoder if self.use_lora else self.llm.model.decoder
+            return dec.layers
+
+    def _compute_eeg_positions(self, input_ids1, input_ids2, mm_seq_len):
+        """Return per-batch EEG token start indices in the final padded sequence.
+        Must stay in sync with the layout built by prepare_inputs."""
+        eff1 = (input_ids1 != self.padding_token_id).sum(dim=1).long()
+        eff2 = (input_ids2 != self.padding_token_id).sum(dim=1).long()
+        final_max_len = mm_seq_len + eff1.max().item() + eff2.max().item()
+        total_lens = mm_seq_len + eff1 + eff2
+        # layout: [pad | prompt(eff1) | eeg(mm_seq_len) | response(eff2)]
+        return final_max_len - total_lens + eff1  # (B,)
+
+    def _make_injection_hook(self, eeg_embeds, eeg_positions, mm_seq_len):
+        """Pre-forward hook: overwrites EEG placeholder positions with actual embeddings.
+        Fires on the input hidden states of the target layer before it runs.
+        Skips injection on KV-cache steps where seq_len shrinks to 1 token."""
+        def hook(module, args):
+            hidden = args[0].clone()
+            seq_len = hidden.size(1)
+            for b in range(hidden.size(0)):
+                start = eeg_positions[b].item()
+                end   = start + mm_seq_len
+                if end <= seq_len:  # full context pass — inject EEG
+                    hidden[b, start:end] = eeg_embeds[b]
+                # else: KV-cache step (seq_len=1), nothing to inject
+            return (hidden,) + args[1:]
+        return hook
+
     def save_pretrained(self, output_dir, *model_args, **kwargs):
         # we need to save all the models separately
         
@@ -330,6 +367,7 @@ class EEGModelForCausalLM(PreTrainedModel):
         input_ids1,
         input_ids2,
         mm_embeds=None,
+        injection_layer: int = 0,
         past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
@@ -344,39 +382,54 @@ class EEGModelForCausalLM(PreTrainedModel):
             # prepare_inputs assumes a sequence of mm_embeds, hence a shape of B*S*N
             # Pooled embeddings : B *N -> B*S*N -> B*1*N for now
             mm_embeds = mm_embeds.unsqueeze(1)
-        final_input_embeds, attention_masks, labels = self.prepare_inputs(
-            input_ids1=input_ids1,
-            input_ids2=input_ids2,
-            mm_emb=mm_embeds,
-        )
 
-        # with torch.no_grad():
+        mm_seq_len = mm_embeds.shape[1]
+
+        if injection_layer > 0:
+            # mid-layer injection: build sequence with zeros at EEG positions,
+            # then overwrite those positions with actual EEG just before layer L fires.
+            eeg_positions = self._compute_eeg_positions(input_ids1, input_ids2, mm_seq_len)
+            zeros = torch.zeros_like(mm_embeds)
+            final_input_embeds, attention_masks, labels = self.prepare_inputs(
+                input_ids1=input_ids1, input_ids2=input_ids2, mm_emb=zeros)
+            hook_handle = self._get_layers()[injection_layer].register_forward_pre_hook(
+                self._make_injection_hook(mm_embeds, eeg_positions, mm_seq_len))
+        else:
+            # original path: EEG is present from the input embedding layer
+            final_input_embeds, attention_masks, labels = self.prepare_inputs(
+                input_ids1=input_ids1, input_ids2=input_ids2, mm_emb=mm_embeds)
+            hook_handle = None
+
         try:
-            llm_outputs = self.llm(
-                input_ids=None,
-                attention_mask=attention_masks,
-                inputs_embeds=final_input_embeds,
-                labels=labels,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                use_cache=use_cache,
-                past_key_values=past_key_values,
-                return_dict=return_dict,
-                **kwargs,
-            )
-        except:
-            # decoder only models like OPT
-            llm_outputs = self.llm(
-                input_ids=None,
-                inputs_embeds=final_input_embeds,
-                labels=labels,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                use_cache=use_cache,
-                past_key_values=past_key_values,
-                return_dict=return_dict,
-                **kwargs,
-            )
+            try:
+                llm_outputs = self.llm(
+                    input_ids=None,
+                    attention_mask=attention_masks,
+                    inputs_embeds=final_input_embeds,
+                    labels=labels,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    use_cache=use_cache,
+                    past_key_values=past_key_values,
+                    return_dict=return_dict,
+                    **kwargs,
+                )
+            except TypeError:
+                # decoder only models like OPT
+                llm_outputs = self.llm(
+                    input_ids=None,
+                    inputs_embeds=final_input_embeds,
+                    labels=labels,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    use_cache=use_cache,
+                    past_key_values=past_key_values,
+                    return_dict=return_dict,
+                    **kwargs,
+                )
+        finally:
+            if hook_handle is not None:
+                hook_handle.remove()
 
         return llm_outputs, labels
 
@@ -385,6 +438,7 @@ class EEGModelForCausalLM(PreTrainedModel):
         input_ids1,
         input_ids2,
         mm_embeds=None,
+        injection_layer: int = 0,
         **kwargs,
     ):
         mm_embeds = self.mm_proj(mm_embeds)
@@ -396,17 +450,36 @@ class EEGModelForCausalLM(PreTrainedModel):
         # Switch this on if you want to test without projector
         # mm_embeds = torch.zeros_like(mm_embeds).to(mm_embeds.device)
 
-        final_input_embeds, attention_masks, labels = self.prepare_inputs(
-            input_ids1=input_ids1,
-            input_ids2=input_ids2,
-            mm_emb=mm_embeds,
-            type="inference",
-        )
-        output_ids = self.llm.generate(
-            input_ids=None,
-            attention_mask=None,
-            position_ids=None,
-            inputs_embeds=final_input_embeds,
-            **kwargs,
-        )
+        mm_seq_len = mm_embeds.shape[1]
+
+        if injection_layer > 0:
+            # same hook strategy as forward(): zeros placeholder, inject at layer L
+            eeg_positions = self._compute_eeg_positions(input_ids1, input_ids2, mm_seq_len)
+            zeros = torch.zeros_like(mm_embeds)
+            final_input_embeds, _, labels = self.prepare_inputs(
+                input_ids1=input_ids1, input_ids2=input_ids2,
+                mm_emb=zeros, type="inference",
+            )
+            hook_handle = self._get_layers()[injection_layer].register_forward_pre_hook(
+                self._make_injection_hook(mm_embeds, eeg_positions, mm_seq_len))
+        else:
+            # original path
+            final_input_embeds, _, labels = self.prepare_inputs(
+                input_ids1=input_ids1, input_ids2=input_ids2,
+                mm_emb=mm_embeds, type="inference",
+            )
+            hook_handle = None
+
+        try:
+            output_ids = self.llm.generate(
+                input_ids=None,
+                attention_mask=None,
+                position_ids=None,
+                inputs_embeds=final_input_embeds,
+                **kwargs,
+            )
+        finally:
+            if hook_handle is not None:
+                hook_handle.remove()
+
         return output_ids, labels

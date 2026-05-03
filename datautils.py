@@ -251,16 +251,24 @@ class SplitterFineTuning:
 
 class Filter:
     # this is to filter datapoints which have valid predicted object labels
-    def __init__(self, dataset, eeg_encoder, device = "cpu") -> None:
+    def __init__(self, dataset, eeg_encoder, device="cpu", token_inject=False) -> None:
         dl = DataLoader(dataset=dataset, batch_size=16, shuffle=False)
         self.data = []
 
         for batch in tqdm.tqdm(dl):
             _, eeg, input_ids1, input_ids2, label_string = batch
-            
+
             eeg = eeg.to(device)
             with torch.no_grad():
-                mm_embeds, cls_logits = eeg_encoder(eeg)
+                # original path: always needed for cls_logits to filter valid samples
+                mm_embeds_pooled, cls_logits = eeg_encoder(eeg)
+
+                if token_inject:
+                    # temporal token path: (B, 10, 50) — used for mid-layer injection
+                    mm_embeds = eeg_encoder(eeg, return_tokens=True)
+                else:
+                    mm_embeds = mm_embeds_pooled
+
             obj_labels = F.softmax(cls_logits, dim=1).argmax(dim=1)
             for i, ls in enumerate(label_string):
                 mm_embeds_i = mm_embeds[i]

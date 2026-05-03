@@ -279,6 +279,18 @@ def get_args_for_llm_finetuning():
         type=str,
         help="Where to report training metrics.",
     )
+    parser.add_argument(
+        "--injection_layer",
+        type=int,
+        default=0,
+        help="LLM layer at which EEG tokens are injected (0 = input embedding level).",
+    )
+    parser.add_argument(
+        "--token_inject",
+        action="store_true",
+        default=False,
+        help="Use temporal token sequence (B,10,50) instead of single pooled embedding.",
+    )
     # Parse arguments
     args = parser.parse_args()
     return args
