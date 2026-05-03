@@ -17,6 +17,7 @@ from datautils import EEGInferenceDataset, SplitterInference
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, BitsAndBytesConfig
 import pandas as pd
+from model_utils import get_chat_messages
 
 
 logging.basicConfig()
@@ -47,15 +48,18 @@ def main():
     tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "left"
 
-    if "gemma" in args.model_path.lower():
-        messages = [
-                {"role": "user", "content": f"<image> <label_string> Describe this image in one sentence:"},
-            ]
-    else:
-        messages = [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": f"<image> <label_string> Describe this image in one sentence:"},
-            ]
+    # --- original hardcoded template (kept for reference) ---
+    # if "gemma" in args.model_path.lower():
+    #     messages = [
+    #             {"role": "user", "content": f"<image> <label_string> Describe this image in one sentence:"},
+    #         ]
+    # else:
+    #     messages = [
+    #             {"role": "system", "content": "You are a helpful assistant."},
+    #             {"role": "user", "content": f"<image> <label_string> Describe this image in one sentence:"},
+    #         ]
+    # --- new: model-family-aware template via model_utils ---
+    messages = get_chat_messages(args.model_path)
     text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     
     max_len = 100

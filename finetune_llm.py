@@ -180,6 +180,7 @@ def main():
             print(f"Stage 3 trained model already available. Loadig model from {pretrained_path}. Skipping retraining")
             del model
             gc.collect()
+            torch.cuda.empty_cache()
             model = EEGModelForCausalLM.from_pretrained(
                 pretrained_model_name_or_path=pretrained_path,llm_low_cpu_mem_usage= True
             )

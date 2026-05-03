@@ -8,6 +8,7 @@ from PIL import Image
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, AutoProcessor
 from constants import label_map, id2label
+from model_utils import get_chat_messages
 
 
 logger = logging.getLogger(__name__)
@@ -121,16 +122,19 @@ class EEGFineTuningDataset:
         self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
         self.tokenizer.padding_side = "left"
         self.max_len = max_len
-        if "gemma" in tokenizer_path.lower():
-            self.messages = [
-                {"role": "user", "content": f"<image> <label_string> Describe this image in one sentence:"},
-            ]
-            # Gemmas do not have system role
-        else:
-            self.messages = [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": f"<image> <label_string> Describe this image in one sentence:"},
-            ]
+        # --- original hardcoded template (kept for reference) ---
+        # if "gemma" in tokenizer_path.lower():
+        #     self.messages = [
+        #         {"role": "user", "content": f"<image> <label_string> Describe this image in one sentence:"},
+        #     ]
+        #     # Gemmas do not have system role
+        # else:
+        #     self.messages = [
+        #         {"role": "system", "content": "You are a helpful assistant."},
+        #         {"role": "user", "content": f"<image> <label_string> Describe this image in one sentence:"},
+        #     ]
+        # --- new: model-family-aware template via model_utils ---
+        self.messages = get_chat_messages(tokenizer_path)
         
         
         # Load EEG signals
@@ -248,7 +252,7 @@ class SplitterFineTuning:
 class Filter:
     # this is to filter datapoints which have valid predicted object labels
     def __init__(self, dataset, eeg_encoder, device = "cpu") -> None:
-        dl = DataLoader(dataset=dataset, batch_size=128, shuffle=False)
+        dl = DataLoader(dataset=dataset, batch_size=16, shuffle=False)
         self.data = []
 
         for batch in tqdm.tqdm(dl):

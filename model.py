@@ -14,6 +14,7 @@ import logging
 import torch.nn as nn
 from peft import LoraConfig, get_peft_model
 import os
+from model_utils import get_lora_target_modules
 
 logger = logging.getLogger(__name__)
 IGNORE_INDEX = -100
@@ -30,6 +31,7 @@ class EEGModelForCausalLM(PreTrainedModel):
         eeg_encoder: Optional[PreTrainedModel] = None,
         llm: Optional[PreTrainedModel] = None,
         use_lora=False,
+        token_inject=False,
     ):
         if config is None and (eeg_encoder is None or llm is None):
             raise ValueError(
@@ -60,22 +62,32 @@ class EEGModelForCausalLM(PreTrainedModel):
         self.padding_token_id = self.llm.config.eos_token_id
         self.bos_token_id = self.llm.config.bos_token_id
         self.use_lora = use_lora
+        self.token_inject = token_inject
 
         if self.eeg_encoder.config.to_dict() != self.config.eeg_encoder.to_dict():
             logger.warning(
-                f"Config of the encoder: {self.encoder.__class__} is overwritten by shared encoder config:"
-                f" {self.config.encoder}"
+                f"Config of the encoder: {self.eeg_encoder.__class__} is overwritten by shared encoder config:"
+                f" {self.config.eeg_encoder}"
             )
         if self.llm.config.to_dict() != self.config.llm.to_dict():
             logger.warning(
-                f"Config of the decoder: {self.decoder.__class__} is overwritten by shared decoder config:"
-                f" {self.config.decoder}"
+                f"Config of the decoder: {self.llm.__class__} is overwritten by shared decoder config:"
+                f" {self.config.llm}"
             )
 
         self.eeg_encoder.config = self.config.eeg_encoder
         self.llm.config = self.config.llm
 
-        if self.eeg_encoder.config.embedding_size != self.llm.config.hidden_size:
+        if token_inject:
+            # per-token projection: each of the 10 temporal tokens (dim=out_channels)
+            # is projected independently to the LLM hidden size.
+            # nn.Linear broadcasts over the sequence dim, so (B,10,50) -> (B,10,hidden).
+            self.mm_proj = nn.Linear(
+                self.eeg_encoder.config.out_channels,
+                self.llm.config.hidden_size,
+            )
+        elif self.eeg_encoder.config.embedding_size != self.llm.config.hidden_size:
+            # original single-token path
             self.mm_proj = nn.Linear(
                 self.eeg_encoder.config.embedding_size,
                 self.llm.config.hidden_size,
@@ -135,6 +147,7 @@ class EEGModelForCausalLM(PreTrainedModel):
         eeg_encoder_path: str = None,
         llm_path: str = None,
         use_lora=False,
+        token_inject=False,
         *model_args,
         **kwargs,
     ) -> PreTrainedModel:
@@ -200,20 +213,25 @@ class EEGModelForCausalLM(PreTrainedModel):
             )
 
         if use_lora:
+            # --- original hardcoded target modules (kept for reference) ---
+            # target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj"]
+            # --- new: resolved from the model family via model_utils ---
+            lora_target_modules = get_lora_target_modules(llm_path or "")
             peft_config = LoraConfig(
                 r=16,
                 lora_alpha=16,
                 lora_dropout=0.05,
                 bias="none",
                 task_type="CAUSAL_LM",
-                target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj"],
+                target_modules=lora_target_modules,
             )
             llm = get_peft_model(llm, peft_config)
             llm.print_trainable_parameters()
         config = EEGModelForCausalLMConfig.from_separate_configs(
             eeg_encoder_config=eeg_encoder.config, llm_config=llm.config, **kwargs
         )
-        return cls(eeg_encoder=eeg_encoder, llm=llm, config=config, use_lora=use_lora)
+        return cls(eeg_encoder=eeg_encoder, llm=llm, config=config, use_lora=use_lora,
+                   token_inject=token_inject)
 
     def prepare_inputs(self, input_ids1, input_ids2, mm_emb, type="train"):
         batch_size, max_length = input_ids1.shape

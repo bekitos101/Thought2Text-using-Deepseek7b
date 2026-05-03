@@ -115,9 +115,17 @@ class ChannelNetModel(PreTrainedModel):
         self.projector = nn.Linear(encoding_size, config.embedding_size)
         self.classifier = nn.Linear(config.embedding_size, config.num_classes)
 
-    def forward(self, x):
+    def forward(self, x, return_tokens=False):
         out = self.encoder(x)
 
+        if return_tokens:
+            # final_conv output is (B, C=50, H=1, W=10) where W is the temporal axis.
+            # Skip flattening to preserve the 10 temporal token structure.
+            out = out.squeeze(2)          # (B, 50, 10)
+            out = out.permute(0, 2, 1)    # (B, 10, 50) — sequence of temporal tokens
+            return out
+
+        # original path — unchanged
         out = out.view(x.size(0), -1)
         emb = self.projector(out)
 
