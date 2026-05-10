@@ -347,6 +347,9 @@ def main():
     dataset.tokenizer.save_pretrained(args.output)
     with open(os.path.join(args.output, "id2label.json"), "w") as f:
         json.dump(dataset.id2label, f)
+    # save injection metadata so from_pretrained can reconstruct the model correctly
+    with open(os.path.join(args.output, "eeg_config.json"), "w") as f:
+        json.dump({"token_inject": args.token_inject, "injection_layer": args.injection_layer}, f)
 
 
 if __name__ == "__main__":

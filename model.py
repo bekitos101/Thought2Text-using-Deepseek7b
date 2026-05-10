@@ -129,16 +129,35 @@ class EEGModelForCausalLM(PreTrainedModel):
         """Pre-forward hook: overwrites EEG placeholder positions with actual embeddings.
         Fires on the input hidden states of the target layer before it runs.
         Skips injection on KV-cache steps where seq_len shrinks to 1 token."""
+        # --- original: in-place assignment severs gradient graph on 8-bit hidden states ---
+        # def hook(module, args):
+        #     hidden = args[0].clone()
+        #     for b in range(hidden.size(0)):
+        #         start = eeg_positions[b].item()
+        #         end   = start + mm_seq_len
+        #         if end <= seq_len:
+        #             hidden[b, start:end] = eeg_embeds[b]
+        #     return (hidden,) + args[1:]
+
+        # out-of-place torch.scatter preserves the gradient graph through both
+        # hidden states (LoRA path) and eeg_embeds (mm_proj path).
         def hook(module, args):
-            hidden = args[0].clone()
+            hidden = args[0]
             seq_len = hidden.size(1)
-            for b in range(hidden.size(0)):
-                start = eeg_positions[b].item()
-                end   = start + mm_seq_len
-                if end <= seq_len:  # full context pass — inject EEG
-                    hidden[b, start:end] = eeg_embeds[b]
-                # else: KV-cache step (seq_len=1), nothing to inject
-            return (hidden,) + args[1:]
+            B, _, H = hidden.shape
+
+            # skip KV-cache auto-regressive steps
+            if (eeg_positions + mm_seq_len).max().item() > seq_len:
+                return args
+
+            # index[b, t, h] = eeg_positions[b] + t  →  shape (B, mm_seq_len, H)
+            idx = (eeg_positions.view(B, 1, 1).to(hidden.device) +
+                   torch.arange(mm_seq_len, device=hidden.device).view(1, mm_seq_len, 1))
+            idx = idx.expand(B, mm_seq_len, H).long()
+
+            # returns a new tensor — does not modify hidden in-place
+            new_hidden = torch.scatter(hidden, 1, idx, eeg_embeds.to(hidden.dtype))
+            return (new_hidden,) + args[1:]
         return hook
 
     def save_pretrained(self, output_dir, *model_args, **kwargs):
@@ -165,6 +184,29 @@ class EEGModelForCausalLM(PreTrainedModel):
         eeg_encoder_path = os.path.join(pretrained_model_name_or_path, "eeg_encoder")
         projector_path = os.path.join(pretrained_model_name_or_path, "projector.pth")
         llm_path = os.path.join(pretrained_model_name_or_path, "llm")
+        eeg_config_path = os.path.join(pretrained_model_name_or_path, "eeg_config.json")
+
+        # --- original ---
+        # model = cls.from_separate_pretrained(eeg_encoder_path, llm_path, ...)
+        # model.mm_proj.load_state_dict(torch.load(projector_path))
+
+        # auto-detect token_inject from projector weight shape:
+        # token_inject=True  → mm_proj weight is (hidden, out_channels=50)
+        # token_inject=False → mm_proj weight is (hidden, 512)
+        proj_state = torch.load(projector_path, map_location="cpu")
+        token_inject = (proj_state["weight"].shape[1] == 50)
+
+        # load injection_layer from saved metadata if available
+        injection_layer = 0
+        if os.path.exists(eeg_config_path):
+            import json
+            with open(eeg_config_path) as f:
+                eeg_cfg = json.load(f)
+            injection_layer = eeg_cfg.get("injection_layer", 0)
+
+        kwargs.setdefault("token_inject", token_inject)
+        kwargs.setdefault("injection_layer", injection_layer)
+
         if use_lora:
             model = None
         else:
@@ -175,7 +217,7 @@ class EEGModelForCausalLM(PreTrainedModel):
                 **kwargs,
             )
 
-        model.mm_proj.load_state_dict(torch.load(projector_path))
+        model.mm_proj.load_state_dict(proj_state)
         return model
 
     @classmethod
@@ -386,12 +428,17 @@ class EEGModelForCausalLM(PreTrainedModel):
         mm_seq_len = mm_embeds.shape[1]
 
         if injection_layer > 0:
-            # mid-layer injection: build sequence with zeros at EEG positions,
-            # then overwrite those positions with actual EEG just before layer L fires.
+            # mid-layer injection: EEG tokens are present from input level so that
+            # gradient checkpointing sees requires_grad=True inputs (needed for backward
+            # to work with 8-bit frozen base weights). The hook re-injects mm_embeds at
+            # layer L via out-of-place scatter, which is the dominant gradient path.
+            # --- original: zeros as placeholder broke gradient checkpointing ---
+            # zeros = torch.zeros_like(mm_embeds)
+            # final_input_embeds, attention_masks, labels = self.prepare_inputs(
+            #     input_ids1=input_ids1, input_ids2=input_ids2, mm_emb=zeros)
             eeg_positions = self._compute_eeg_positions(input_ids1, input_ids2, mm_seq_len)
-            zeros = torch.zeros_like(mm_embeds)
             final_input_embeds, attention_masks, labels = self.prepare_inputs(
-                input_ids1=input_ids1, input_ids2=input_ids2, mm_emb=zeros)
+                input_ids1=input_ids1, input_ids2=input_ids2, mm_emb=mm_embeds)
             hook_handle = self._get_layers()[injection_layer].register_forward_pre_hook(
                 self._make_injection_hook(mm_embeds, eeg_positions, mm_seq_len))
         else:

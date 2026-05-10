@@ -1,0 +1,2 @@
+,Mean BERTScore,Mean BLEU Score,Mean BLEU Unigram Score,Mean Meteor Score,Mean ROUGE-1,Mean ROUGE-2,Mean ROUGE-l,Object Accuracy,SD BERTScore,SD BLEU Score,SD BLEU Unigram Score,SD Meteor Score,SD ROUGE-1,SD ROUGE-2,SD ROUGE-l
+results_deepseek-llm-7b-chat_all,0.891,0.054,0.253,0.257,0.297,0.076,0.266,0.531,0.025,0.071,0.13,0.15,0.135,0.108,0.128

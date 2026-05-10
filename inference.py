@@ -104,8 +104,12 @@ def main():
         
 
     # read injection config from the loaded model
+    # --injection_layer_override allows depth sweep without retraining (Phase 1)
     injection_layer = getattr(model.config, "injection_layer", 0)
-    token_inject    = getattr(model, "token_inject", False)
+    if args.injection_layer_override is not None:
+        injection_layer = args.injection_layer_override
+        logger.info(f"Injection layer overridden to {injection_layer} (no retraining)")
+    token_inject = getattr(model, "token_inject", False)
 
     for batch in tqdm(test_dataloader):
         eeg, label_string, caption_raw, image_path = batch

@@ -16,14 +16,16 @@
 
 set -e   # stop on first error
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export TRANSFORMERS_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
 
 # ── paths ─────────────────────────────────────────────────────────────────────
-LLM="deepseek-ai/deepseek-llm-7b-chat"
+# use local checkpoint — no internet required
+LLM="all_models/deepseek-llm-7b-chat_all/llm"
 EEG_DATASET="data/block/eeg_55_95_std.pth"
 SPLITS_PATH="data/block/block_splits_by_image_all.pth"
 EEG_ENCODER_PATH="./eeg_encoder_55-95_40_classes"
 IMAGE_DIR="data/images/"
-SAVED_PRETRAINED="all_models"
 
 # ── ablation config ───────────────────────────────────────────────────────────
 # N/4-interval depths for a 28-layer DeepSeek-7B
@@ -44,12 +46,20 @@ run_finetune() {
         --image_dir         "$IMAGE_DIR" \
         --output            "$output_dir" \
         --llm_backbone_name_or_path "$LLM" \
-        --saved_pretrained_model_path "$SAVED_PRETRAINED" \
         --no_stage2 \
         --load_in_8bit \
         --batch_size        4 \
         --injection_layer   "$layer" \
         $token_inject_flag
+}
+
+cleanup_checkpoint() {
+    # disk is tight (~8GB free, each checkpoint ~7.3GB)
+    # delete model checkpoint after inference to make room for next run
+    local dir=$1
+    echo "Freeing disk: removing $dir/llm ..."
+    rm -rf "$dir/llm"
+    df -h / | tail -1
 }
 
 run_inference() {
@@ -72,9 +82,18 @@ echo "================================================================"
 BASELINE_DIR="all_models/ablation_baseline"
 BASELINE_CSV="results/ablation_baseline.csv"
 
-run_finetune 0 "" "$BASELINE_DIR"
-run_inference "$BASELINE_DIR" "$BASELINE_CSV"
-echo "Baseline done → $BASELINE_CSV"
+if [ -f "$BASELINE_CSV" ]; then
+    echo "SKIP: $BASELINE_CSV already exists, skipping baseline."
+else
+    if [ -d "$BASELINE_DIR/llm" ]; then
+        echo "RESUME: checkpoint found, skipping fine-tune, running inference only."
+    else
+        run_finetune 0 "" "$BASELINE_DIR"
+    fi
+    run_inference "$BASELINE_DIR" "$BASELINE_CSV"
+    cleanup_checkpoint "$BASELINE_DIR"
+    echo "Baseline done → $BASELINE_CSV"
+fi
 
 # ── ablation sweep ────────────────────────────────────────────────────────────
 for L in "${INJECTION_LAYERS[@]}"; do
@@ -86,8 +105,18 @@ for L in "${INJECTION_LAYERS[@]}"; do
     MODEL_DIR="all_models/ablation_layer_${L}"
     RESULTS_CSV="results/ablation_layer_${L}.csv"
 
-    run_finetune "$L" "--token_inject" "$MODEL_DIR"
+    if [ -f "$RESULTS_CSV" ]; then
+        echo "SKIP: $RESULTS_CSV already exists, skipping layer ${L}."
+        continue
+    fi
+
+    if [ -d "$MODEL_DIR/llm" ]; then
+        echo "RESUME: checkpoint found for layer ${L}, skipping fine-tune, running inference only."
+    else
+        run_finetune "$L" "--token_inject" "$MODEL_DIR"
+    fi
     run_inference "$MODEL_DIR" "$RESULTS_CSV"
+    cleanup_checkpoint "$MODEL_DIR"
     echo "Layer ${L} done → $RESULTS_CSV"
 done
 

@@ -347,6 +347,12 @@ def get_args_for_llm_inference():
         required=True,
         help="Directory to save the model checkpoints and logs.",
     )
+    parser.add_argument(
+        "--injection_layer_override",
+        type=int,
+        default=None,
+        help="Override injection layer from model config (for depth sweep without retraining).",
+    )
 
     # Parse arguments
     args = parser.parse_args()
