@@ -1,0 +1,73 @@
+{
+  "_name_or_path": "./eeg_encoder_55-95_40_classes",
+  "architectures": [
+    "ChannelNetModel"
+  ],
+  "attn_heads": 4,
+  "d_model": 64,
+  "data_shape": [
+    256,
+    5
+  ],
+  "device": "cuda",
+  "down_kernel": 3,
+  "down_stride": 2,
+  "dropout": 0.2,
+  "embedding_size": 512,
+  "enable_res_parameter": 1,
+  "encoder_hidden_size": 64,
+  "in_channels": 1,
+  "input_height": 128,
+  "input_width": 440,
+  "layers": 8,
+  "mask_ratio": 0.6,
+  "model_type": "eegencoder",
+  "momentum": 0.99,
+  "num_class": 1,
+  "num_classes": 40,
+  "num_residual_blocks": 4,
+  "num_spatial_layers": 4,
+  "num_temp_layers": 4,
+  "out_channels": 50,
+  "projection_hidden_size": 512,
+  "reg_layers": 4,
+  "spatial_stride": [
+    2,
+    1
+  ],
+  "temp_channels": 10,
+  "temporal_dilation_list": [
+    [
+      1,
+      1
+    ],
+    [
+      1,
+      2
+    ],
+    [
+      1,
+      4
+    ],
+    [
+      1,
+      8
+    ],
+    [
+      1,
+      16
+    ]
+  ],
+  "temporal_kernel": [
+    1,
+    33
+  ],
+  "temporal_stride": [
+    1,
+    2
+  ],
+  "torch_dtype": "float32",
+  "transformers_version": "4.44.0",
+  "vocab_size": 192,
+  "wave_length": 8
+}
