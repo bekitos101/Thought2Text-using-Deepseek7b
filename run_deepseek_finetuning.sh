@@ -9,7 +9,7 @@
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-LLM="deepseek-ai/deepseek-llm-7b-chat"
+LLM="base_model/deepseek-llm-7b-chat"
 LLM_NAME=$(echo "$LLM" | awk -F '/' '{print $2}')
 
 OUTPUT_DIR="all_models/${LLM_NAME}_all"

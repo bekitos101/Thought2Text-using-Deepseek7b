@@ -134,7 +134,7 @@ def score(refs, cands):
 results = {}
 
 # original trained model (layer 0)
-orig = pd.read_csv("results/all_results.csv", index_col=0).loc["results_deepseek-llm-7b-chat_all"]
+orig = pd.read_csv("results/baseline/all_results.csv", index_col=0).loc["results_deepseek-llm-7b-chat_all"]
 results["Original S2+S3 layer_0"] = {
     "BLEU": orig["Mean BLEU Score"], "BLEU-1": orig["Mean BLEU Unigram Score"],
     "ROUGE-1": orig["Mean ROUGE-1"], "ROUGE-L": orig["Mean ROUGE-l"],
