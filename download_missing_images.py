@@ -5,6 +5,9 @@ Uses the Google Drive API v3 (with API key) to enumerate ALL files in each
 image class folder — no 50-file limit — then downloads only the missing
 caption, sketch, and original JPEG files.
 
+No log file required: class subfolders are enumerated directly from the
+parent Drive folder via the API.
+
 Usage:
     python download_missing_images.py --api-key YOUR_KEY [--dry-run]
 """
@@ -18,28 +21,46 @@ from pathlib import Path
 import requests
 
 # ── constants ────────────────────────────────────────────────────────────────
-IMAGES_DIR   = Path(__file__).parent / "data" / "images"
-LOG_FILE     = "/tmp/gdown_images.log"
-DRIVE_API    = "https://www.googleapis.com/drive/v3/files"
-DOWNLOAD_URL = "https://drive.google.com/uc?id={id}&export=download"
-SKIP_PATTERN = re.compile(r"_spectro_\d+\.JPEG$")
+IMAGES_DIR      = Path(__file__).parent / "data" / "images"
+PARENT_FOLDER_ID = "1XqV6MMl28iYXkQBMEFHfEXllGmCbqpOu"
+DRIVE_API       = "https://www.googleapis.com/drive/v3/files"
+DOWNLOAD_URL    = "https://drive.google.com/uc?id={id}&export=download"
+SKIP_PATTERN    = re.compile(r"_spectro_\d+\.JPEG$")
 NEEDED_SUFFIXES = ("_caption.txt", "_sketch.JPEG", ".JPEG")
-DELAY_SEC    = 0.5
-MAX_RETRIES  = 3
+DELAY_SEC       = 0.5
+MAX_RETRIES     = 3
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
-def parse_folder_ids(log_path: str) -> dict:
-    """Returns {class_name: folder_id} from the gdown enumeration log."""
-    folder_re = re.compile(r"^Retrieving folder ([A-Za-z0-9_-]{25,}) (n\d+)$")
-    result = {}
-    with open(log_path) as f:
-        for line in f:
-            m = folder_re.match(line.rstrip())
-            if m:
-                folder_id, class_name = m.group(1), m.group(2)
-                result[class_name] = folder_id
-    return result
+def list_subfolders(parent_id: str, api_key: str) -> dict:
+    """Returns {name: folder_id} for all subfolders of a Drive folder."""
+    folders = {}
+    params = {
+        "q": f"'{parent_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
+        "fields": "nextPageToken,files(id,name)",
+        "pageSize": 1000,
+        "key": api_key,
+    }
+    while True:
+        resp = requests.get(DRIVE_API, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        for f in data.get("files", []):
+            folders[f["name"]] = f["id"]
+        token = data.get("nextPageToken")
+        if not token:
+            break
+        params["pageToken"] = token
+    return folders
+
+
+def list_class_folders(parent_id: str, api_key: str) -> dict:
+    """Returns {class_name: folder_id} by drilling into the 'images' subfolder."""
+    top_level = list_subfolders(parent_id, api_key)
+    if "images" not in top_level:
+        raise RuntimeError(f"No 'images' subfolder found in Drive folder {parent_id}. Found: {list(top_level)}")
+    images_id = top_level["images"]
+    return list_subfolders(images_id, api_key)
 
 
 def list_all_files(folder_id: str, api_key: str) -> list:
@@ -106,8 +127,9 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    folder_map = parse_folder_ids(LOG_FILE)
-    print(f"Classes: {len(folder_map)}")
+    print("Enumerating class folders from Drive...")
+    folder_map = list_class_folders(PARENT_FOLDER_ID, args.api_key)
+    print(f"Classes found: {len(folder_map)}")
     if args.dry_run:
         print("DRY RUN — nothing will be written\n")
 

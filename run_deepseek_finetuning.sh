@@ -8,6 +8,7 @@
 # automatically — no other code changes are required.
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export USE_TF=0
 
 LLM="base_model/deepseek-llm-7b-chat"
 LLM_NAME=$(echo "$LLM" | awk -F '/' '{print $2}')
