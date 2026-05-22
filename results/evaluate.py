@@ -2,13 +2,15 @@
 evaluate.py
 -----------
 Reproduces metrics_based_evaluation_notebook.ipynb as a plain script.
-Computes BLEU, ROUGE, METEOR, BERTScore for every CSV in the results/ folder
-and saves a summary to results/all_results.csv.
+Computes BLEU, ROUGE, METEOR, BERTScore for every CSV in a results folder
+and saves a summary to all_results.csv in that folder.
 
 Usage:
-    python results/evaluate.py
+    python results/evaluate.py                          # runs on results/ dir
+    python results/evaluate.py --results-dir path/to/  # runs on any dir
 """
 
+import argparse
 import os
 import re
 import statistics
@@ -26,7 +28,18 @@ nltk.download("punkt", quiet=True)
 nltk.download("wordnet", quiet=True)
 nltk.download("punkt_tab", quiet=True)
 
-RESULTS_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--results-dir",
+        default=os.path.dirname(os.path.abspath(__file__)),
+        help="Directory containing prediction CSVs (default: same dir as this script)",
+    )
+    return parser.parse_args()
+
+
+RESULTS_DIR = None  # set in main
 
 
 # ── metric functions (unchanged from notebook) ───────────────────────────────
@@ -135,8 +148,13 @@ def run(csv_path):
 # ── main ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    args = parse_args()
+    RESULTS_DIR = os.path.abspath(args.results_dir)
+    print(f"Evaluating CSVs in: {RESULTS_DIR}")
+
     all_res = {}
-    csv_files = [f for f in os.listdir(RESULTS_DIR) if f.endswith(".csv") and f != "all_results.csv"]
+    _skip = {"all_results.csv", "sweep_summary.csv"}
+    csv_files = sorted(f for f in os.listdir(RESULTS_DIR) if f.endswith(".csv") and f not in _skip)
 
     for fname in csv_files:
         print(f"\nEvaluating: {fname} ...")

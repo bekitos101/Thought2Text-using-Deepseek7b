@@ -107,58 +107,233 @@ class EEGModelForCausalLM(PreTrainedModel):
     def _get_layers(self):
         """Return the transformer block list for any supported model family."""
         try:
-            # LLaMA / DeepSeek / Qwen / Mistral
             lm = self.llm.model.model if self.use_lora else self.llm.model
             return lm.layers
         except AttributeError:
-            # OPT
             dec = self.llm.model.model.decoder if self.use_lora else self.llm.model.decoder
             return dec.layers
 
-    def _compute_eeg_positions(self, input_ids1, input_ids2, mm_seq_len):
-        """Return per-batch EEG token start indices in the final padded sequence.
-        Must stay in sync with the layout built by prepare_inputs."""
-        eff1 = (input_ids1 != self.padding_token_id).sum(dim=1).long()
-        eff2 = (input_ids2 != self.padding_token_id).sum(dim=1).long()
-        final_max_len = mm_seq_len + eff1.max().item() + eff2.max().item()
-        total_lens = mm_seq_len + eff1 + eff2
-        # layout: [pad | prompt(eff1) | eeg(mm_seq_len) | response(eff2)]
-        return final_max_len - total_lens + eff1  # (B,)
+    def _get_backbone(self):
+        """Return the inner backbone (LlamaModel or equivalent)."""
+        try:
+            return self.llm.model.model if self.use_lora else self.llm.model
+        except AttributeError:
+            return self.llm.model.model.decoder if self.use_lora else self.llm.model.decoder
 
-    def _make_injection_hook(self, eeg_embeds, eeg_positions, mm_seq_len):
-        """Pre-forward hook: overwrites EEG placeholder positions with actual embeddings.
-        Fires on the input hidden states of the target layer before it runs.
-        Skips injection on KV-cache steps where seq_len shrinks to 1 token."""
-        # --- original: in-place assignment severs gradient graph on 8-bit hidden states ---
-        # def hook(module, args):
-        #     hidden = args[0].clone()
-        #     for b in range(hidden.size(0)):
-        #         start = eeg_positions[b].item()
-        #         end   = start + mm_seq_len
-        #         if end <= seq_len:
-        #             hidden[b, start:end] = eeg_embeds[b]
-        #     return (hidden,) + args[1:]
+    # ── True DeepInsert (EACL 2026) ──────────────────────────────────────────
+    # Stage 1: text-only [pad|prompt|response] through layers 0..L-1 (no EEG).
+    # At layer L: EEG tokens physically inserted into the hidden-state tensor.
+    # Stage 2: expanded sequence through layers L..N-1.
 
-        # out-of-place torch.scatter preserves the gradient graph through both
-        # hidden states (LoRA path) and eeg_embeds (mm_proj path).
-        def hook(module, args):
-            hidden = args[0]
-            seq_len = hidden.size(1)
-            B, _, H = hidden.shape
+    def _deepinsert_forward(self, input_ids1, input_ids2, mm_embeds, injection_layer):
+        """Training forward with true two-stage bypass."""
+        backbone = self._get_backbone()
+        layers   = backbone.layers
+        pad_id   = self.padding_token_id
+        B        = input_ids1.shape[0]
+        E        = mm_embeds.shape[1]
+        H        = backbone.config.hidden_size
+        device   = input_ids1.device
+        dtype    = backbone.embed_tokens.weight.dtype
 
-            # skip KV-cache auto-regressive steps
-            if (eeg_positions + mm_seq_len).max().item() > seq_len:
-                return args
+        eff1     = (input_ids1 != pad_id).sum(1).long()
+        eff2     = (input_ids2 != pad_id).sum(1).long()
+        max_eff1 = eff1.max().item()
+        max_eff2 = eff2.max().item()
+        T        = max_eff1 + max_eff2
+        mm_embeds = mm_embeds.to(dtype)   # align with embed_tokens dtype
 
-            # index[b, t, h] = eeg_positions[b] + t  →  shape (B, mm_seq_len, H)
-            idx = (eeg_positions.view(B, 1, 1).to(hidden.device) +
-                   torch.arange(mm_seq_len, device=hidden.device).view(1, mm_seq_len, 1))
-            idx = idx.expand(B, mm_seq_len, H).long()
+        # ── Build text-only [pad | prompt | response] ───────────────────────
+        text_embeds = torch.zeros(B, T, H, device=device, dtype=dtype)
+        text_labels = torch.full((B, T), IGNORE_INDEX, device=device, dtype=torch.long)
+        for i in range(B):
+            e1, e2 = eff1[i].item(), eff2[i].item()
+            p = T - e1 - e2
+            text_embeds[i, p:p+e1] = backbone.embed_tokens(input_ids1[i, -e1:])
+            text_embeds[i, p+e1:T] = backbone.embed_tokens(input_ids2[i, -e2:])
+            text_labels[i, p:p+e1] = input_ids1[i, -e1:]
+            text_labels[i, p+e1:T] = input_ids2[i, -e2:]
 
-            # returns a new tensor — does not modify hidden in-place
-            new_hidden = torch.scatter(hidden, 1, idx, eeg_embeds.to(hidden.dtype))
-            return (new_hidden,) + args[1:]
-        return hook
+        pos_ids_1 = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
+
+        # 4-D causal+padding mask: prevents real tokens from attending to
+        # zero-padded positions, matching the original prepare_inputs behaviour.
+        # Shape: (B, 1, seq_len, seq_len) — added to raw attention scores.
+        NEG_INF = torch.finfo(dtype).min
+        def _causal_pad_mask(seq_len, pad_starts):
+            # pad_starts: (B,) int tensor — index of the first real token per element
+            causal   = torch.tril(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool))
+            mask     = torch.full((B, 1, seq_len, seq_len), NEG_INF, device=device, dtype=dtype)
+            for i in range(B):
+                valid_kv  = torch.arange(seq_len, device=device) >= pad_starts[i]  # (seq_len,)
+                mask[i, 0] = torch.where(causal & valid_kv.unsqueeze(0), 0.0, NEG_INF)
+            return mask  # (B, 1, seq_len, seq_len)
+
+        pad_starts = (T - eff1 - eff2).clamp(min=0)   # (B,) — 0 when no padding
+        attn1 = _causal_pad_mask(T, pad_starts)
+
+        # ── Stage 1: text-only through layers 0..L-1 ────────────────────────
+        with torch.no_grad():
+            hidden = text_embeds
+            for layer in layers[:injection_layer]:
+                hidden = layer(hidden, attention_mask=attn1,
+                               position_ids=pos_ids_1, use_cache=False)[0]
+
+        # ── Insert EEG between prompt and response hidden states ─────────────
+        eeg_ign = torch.full((E,), IGNORE_INDEX, device=device, dtype=torch.long)
+        parts_h, parts_l = [], []
+        for i in range(B):
+            ins = T - eff2[i].item()          # split point: end of [pad|prompt]
+            parts_h.append(torch.cat([hidden[i, :ins], mm_embeds[i], hidden[i, ins:]], 0))
+            parts_l.append(torch.cat([text_labels[i, :ins], eeg_ign, text_labels[i, ins:]], 0))
+
+        hidden      = torch.stack(parts_h, 0)   # (B, T+E, H)
+        full_labels = torch.stack(parts_l, 0)   # (B, T+E)
+        T_full      = T + E
+        pos_ids_2   = torch.arange(T_full, device=device).unsqueeze(0).expand(B, -1)
+
+        # Stage-2 padding region is unchanged: EEG tokens are inserted after
+        # the prompt (after the pad prefix), so pad_starts is the same.
+        attn2 = _causal_pad_mask(T_full, pad_starts)
+
+        # ── Stage 2: full sequence through layers L..N-1 ────────────────────
+        for layer in layers[injection_layer:]:
+            hidden = layer(hidden, attention_mask=attn2,
+                           position_ids=pos_ids_2, use_cache=False)[0]
+
+        target_dtype = self.llm.lm_head.weight.dtype
+        logits = self.llm.lm_head(backbone.norm(hidden.to(target_dtype)))
+
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = full_labels[..., 1:].contiguous()
+        loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=IGNORE_INDEX,
+        )
+
+        from transformers.modeling_outputs import CausalLMOutputWithPast
+        return CausalLMOutputWithPast(loss=loss, logits=logits), full_labels
+
+    def _deepinsert_generate(self, input_ids1, input_ids2, mm_embeds, injection_layer,
+                              max_new_tokens=100, repetition_penalty=1.0, **kwargs):
+        """Inference with true two-stage bypass and KV-cache.
+
+        Mirrors _deepinsert_forward exactly:
+          Stage 1: [pad|prompt|suffix] through layers 0..L-1
+          EEG inserted between prompt_hidden and suffix_hidden
+          Stage 2: [pad|prompt_h|EEG|suffix_h] through layers L..N-1
+          Generate from after suffix → outputs caption only
+        """
+        from transformers.cache_utils import DynamicCache
+
+        backbone  = self._get_backbone()
+        layers    = backbone.layers
+        pad_id    = self.padding_token_id
+        eos_id    = self.llm.config.eos_token_id
+        B         = input_ids1.shape[0]
+        E         = mm_embeds.shape[1]
+        H         = backbone.config.hidden_size
+        device    = input_ids1.device
+        dtype     = backbone.embed_tokens.weight.dtype
+
+        eff1      = (input_ids1 != pad_id).sum(1).long()
+        eff2      = (input_ids2 != pad_id).sum(1).long()
+        max_eff1  = eff1.max().item()
+        max_eff2  = eff2.max().item()
+        T         = max_eff1 + max_eff2   # prompt + suffix (no EEG) in stage-1
+        T_full    = T + E                 # prompt + EEG + suffix in stage-2
+        mm_embeds = mm_embeds.to(dtype)
+
+        # ── Build [pad | prompt | suffix] embeddings (mirrors training) ──────
+        text_embeds = torch.zeros(B, T, H, device=device, dtype=dtype)
+        for i in range(B):
+            e1, e2 = eff1[i].item(), eff2[i].item()
+            p = T - e1 - e2   # pad length (0 when no padding)
+            text_embeds[i, p:p+e1]  = backbone.embed_tokens(input_ids1[i, -e1:])
+            text_embeds[i, p+e1:T]  = backbone.embed_tokens(input_ids2[i, -e2:])
+
+        cache  = DynamicCache()
+        pos_1  = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
+        cpos_1 = torch.arange(T, device=device)
+
+        with torch.no_grad():
+            # ── Stage 1 prefill: [pad|prompt|suffix] through layers 0..L-1 ──
+            hidden = text_embeds
+            for layer in layers[:injection_layer]:
+                hidden = layer(hidden, attention_mask=None, position_ids=pos_1,
+                               past_key_value=cache, use_cache=True,
+                               cache_position=cpos_1)[0]
+
+            # ── Insert EEG between prompt_hidden and suffix_hidden ───────────
+            parts_h = []
+            for i in range(B):
+                ins = T - eff2[i].item()  # end of [pad|prompt], start of suffix
+                parts_h.append(
+                    torch.cat([hidden[i, :ins], mm_embeds[i], hidden[i, ins:]], 0)
+                )
+            stage2_in = torch.stack(parts_h, 0)   # (B, T_full, H)
+
+            # ── Stage 2 prefill: [pad|prompt_h|EEG|suffix_h] through layers L..N-1
+            pos_2  = torch.arange(T_full, device=device).unsqueeze(0).expand(B, -1)
+            cpos_2 = torch.arange(T_full, device=device)
+            hidden = stage2_in
+            for layer in layers[injection_layer:]:
+                hidden = layer(hidden, attention_mask=None, position_ids=pos_2,
+                               past_key_value=cache, use_cache=True,
+                               cache_position=cpos_2)[0]
+
+            # First generated token from last suffix position
+            _td        = self.llm.lm_head.weight.dtype
+            logit      = self.llm.lm_head(backbone.norm(hidden[:, -1:, :].to(_td)))[:, 0, :]
+            next_token = logit.argmax(-1, keepdim=True)   # (B, 1)
+
+        generated = [next_token]
+        finished  = next_token.squeeze(1) == eos_id
+
+        with torch.no_grad():
+            for step in range(1, max_new_tokens):
+                if finished.all():
+                    break
+
+                embed = backbone.embed_tokens(generated[-1])   # (B, 1, H)
+
+                # Stage 1 decode: position T+step-1 (after full prompt+suffix)
+                s1i   = T + step - 1
+                s1pos = torch.full((B, 1), s1i, device=device, dtype=torch.long)
+                s1cp  = torch.tensor([s1i], device=device, dtype=torch.long)
+                hidden = embed
+                for layer in layers[:injection_layer]:
+                    hidden = layer(hidden, attention_mask=None, position_ids=s1pos,
+                                   past_key_value=cache, use_cache=True,
+                                   cache_position=s1cp)[0]
+
+                # Stage 2 decode: position T_full+step-1 (after prompt+EEG+suffix)
+                s2i   = T_full + step - 1
+                s2pos = torch.full((B, 1), s2i, device=device, dtype=torch.long)
+                s2cp  = torch.tensor([s2i], device=device, dtype=torch.long)
+                for layer in layers[injection_layer:]:
+                    hidden = layer(hidden, attention_mask=None, position_ids=s2pos,
+                                   past_key_value=cache, use_cache=True,
+                                   cache_position=s2cp)[0]
+
+                logit = self.llm.lm_head(backbone.norm(hidden.to(_td)))[:, 0, :]
+
+                if repetition_penalty != 1.0:
+                    gen_ids = torch.cat(generated, dim=1)
+                    for b in range(B):
+                        for tok in gen_ids[b].tolist():
+                            if logit[b, tok] < 0:
+                                logit[b, tok] *= repetition_penalty
+                            else:
+                                logit[b, tok] /= repetition_penalty
+
+                next_token = logit.argmax(-1, keepdim=True)
+                generated.append(next_token)
+                finished = finished | (next_token.squeeze(1) == eos_id)
+
+        return torch.cat(generated, dim=1), None
+
 
     def save_pretrained(self, output_dir, *model_args, **kwargs):
         # we need to save all the models separately
@@ -418,66 +593,40 @@ class EEGModelForCausalLM(PreTrainedModel):
         **kwargs,
     ):
         mm_embeds = self.mm_proj(mm_embeds)
-
         if len(mm_embeds.shape) == 2:
-            # We are working on pooled embeddings now, but in the future, patched embeddings are possible
-            # prepare_inputs assumes a sequence of mm_embeds, hence a shape of B*S*N
-            # Pooled embeddings : B *N -> B*S*N -> B*1*N for now
             mm_embeds = mm_embeds.unsqueeze(1)
 
-        mm_seq_len = mm_embeds.shape[1]
-
         if injection_layer > 0:
-            # mid-layer injection: EEG tokens are present from input level so that
-            # gradient checkpointing sees requires_grad=True inputs (needed for backward
-            # to work with 8-bit frozen base weights). The hook re-injects mm_embeds at
-            # layer L via out-of-place scatter, which is the dominant gradient path.
-            # --- original: zeros as placeholder broke gradient checkpointing ---
-            # zeros = torch.zeros_like(mm_embeds)
-            # final_input_embeds, attention_masks, labels = self.prepare_inputs(
-            #     input_ids1=input_ids1, input_ids2=input_ids2, mm_emb=zeros)
-            eeg_positions = self._compute_eeg_positions(input_ids1, input_ids2, mm_seq_len)
-            final_input_embeds, attention_masks, labels = self.prepare_inputs(
-                input_ids1=input_ids1, input_ids2=input_ids2, mm_emb=mm_embeds)
-            hook_handle = self._get_layers()[injection_layer].register_forward_pre_hook(
-                self._make_injection_hook(mm_embeds, eeg_positions, mm_seq_len))
-        else:
-            # original path: EEG is present from the input embedding layer
-            final_input_embeds, attention_masks, labels = self.prepare_inputs(
-                input_ids1=input_ids1, input_ids2=input_ids2, mm_emb=mm_embeds)
-            hook_handle = None
+            return self._deepinsert_forward(input_ids1, input_ids2, mm_embeds, injection_layer)
 
+        # injection_layer == 0: original full-sequence path
+        final_input_embeds, attention_masks, labels = self.prepare_inputs(
+            input_ids1=input_ids1, input_ids2=input_ids2, mm_emb=mm_embeds)
         try:
-            try:
-                llm_outputs = self.llm(
-                    input_ids=None,
-                    attention_mask=attention_masks,
-                    inputs_embeds=final_input_embeds,
-                    labels=labels,
-                    output_attentions=output_attentions,
-                    output_hidden_states=output_hidden_states,
-                    use_cache=use_cache,
-                    past_key_values=past_key_values,
-                    return_dict=return_dict,
-                    **kwargs,
-                )
-            except TypeError:
-                # decoder only models like OPT
-                llm_outputs = self.llm(
-                    input_ids=None,
-                    inputs_embeds=final_input_embeds,
-                    labels=labels,
-                    output_attentions=output_attentions,
-                    output_hidden_states=output_hidden_states,
-                    use_cache=use_cache,
-                    past_key_values=past_key_values,
-                    return_dict=return_dict,
-                    **kwargs,
-                )
-        finally:
-            if hook_handle is not None:
-                hook_handle.remove()
-
+            llm_outputs = self.llm(
+                input_ids=None,
+                attention_mask=attention_masks,
+                inputs_embeds=final_input_embeds,
+                labels=labels,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                use_cache=use_cache,
+                past_key_values=past_key_values,
+                return_dict=return_dict,
+                **kwargs,
+            )
+        except TypeError:
+            llm_outputs = self.llm(
+                input_ids=None,
+                inputs_embeds=final_input_embeds,
+                labels=labels,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                use_cache=use_cache,
+                past_key_values=past_key_values,
+                return_dict=return_dict,
+                **kwargs,
+            )
         return llm_outputs, labels
 
     def generate(
@@ -490,43 +639,22 @@ class EEGModelForCausalLM(PreTrainedModel):
     ):
         mm_embeds = self.mm_proj(mm_embeds)
         if len(mm_embeds.shape) == 2:
-            # We are working on pooled embeddings now, but in the future, patched embeddings are possible
-            # prepare_inputs assumes a sequence of mm_embeds, hence a shape of B*S*N
-            # Pooled embeddings : B *N -> B*S*N -> B*1*N for now
             mm_embeds = mm_embeds.unsqueeze(1)
-        # Switch this on if you want to test without projector
-        # mm_embeds = torch.zeros_like(mm_embeds).to(mm_embeds.device)
-
-        mm_seq_len = mm_embeds.shape[1]
 
         if injection_layer > 0:
-            # same hook strategy as forward(): zeros placeholder, inject at layer L
-            eeg_positions = self._compute_eeg_positions(input_ids1, input_ids2, mm_seq_len)
-            zeros = torch.zeros_like(mm_embeds)
-            final_input_embeds, _, labels = self.prepare_inputs(
-                input_ids1=input_ids1, input_ids2=input_ids2,
-                mm_emb=zeros, type="inference",
-            )
-            hook_handle = self._get_layers()[injection_layer].register_forward_pre_hook(
-                self._make_injection_hook(mm_embeds, eeg_positions, mm_seq_len))
-        else:
-            # original path
-            final_input_embeds, _, labels = self.prepare_inputs(
-                input_ids1=input_ids1, input_ids2=input_ids2,
-                mm_emb=mm_embeds, type="inference",
-            )
-            hook_handle = None
+            return self._deepinsert_generate(
+                input_ids1, input_ids2, mm_embeds, injection_layer, **kwargs)
 
-        try:
-            output_ids = self.llm.generate(
-                input_ids=None,
-                attention_mask=None,
-                position_ids=None,
-                inputs_embeds=final_input_embeds,
-                **kwargs,
-            )
-        finally:
-            if hook_handle is not None:
-                hook_handle.remove()
-
+        # injection_layer == 0: original full-sequence path
+        final_input_embeds, _, labels = self.prepare_inputs(
+            input_ids1=input_ids1, input_ids2=input_ids2,
+            mm_emb=mm_embeds, type="inference",
+        )
+        output_ids = self.llm.generate(
+            input_ids=None,
+            attention_mask=None,
+            position_ids=None,
+            inputs_embeds=final_input_embeds,
+            **kwargs,
+        )
         return output_ids, labels

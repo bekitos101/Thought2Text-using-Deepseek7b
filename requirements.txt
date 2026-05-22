@@ -14,3 +14,4 @@ tensorboardX
 nltk==3.9.1
 rouge==1.0.1
 gdown
+bert-score

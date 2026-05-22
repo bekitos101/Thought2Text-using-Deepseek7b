@@ -5,7 +5,9 @@
 
 set -e
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export TRANSFORMERS_OFFLINE=1
+export USE_TF=0
+# TRANSFORMERS_OFFLINE kept for inference (base LLM is local), but NOT set globally
+# so evaluate.py can reach the cached roberta-large for BERTScore.
 export HF_DATASETS_OFFLINE=1
 
 VENV_DIR="$(cd "$(dirname "$0")" && pwd)/venv"
@@ -25,7 +27,7 @@ if [ -f "$DEST" ]; then
 fi
 
 echo "Running inference-only sweep at injection_layer=4 ..."
-python inference.py \
+TRANSFORMERS_OFFLINE=1 python inference.py \
     --model_path               "$MODEL_PATH" \
     --eeg_dataset              "$EEG_DATASET" \
     --image_dir                "$IMAGE_DIR" \
@@ -35,60 +37,21 @@ python inference.py \
 
 echo "Done → $DEST"
 
-# Print updated sweep summary alongside existing results
+# Run full evaluation (BLEU, ROUGE-1/2/L, METEOR, BERTScore) on all sweep CSVs.
+# roberta-large must be in the HF cache (run once with internet: venv/bin/python -c
+# "from transformers import AutoModel; AutoModel.from_pretrained('roberta-large')")
+echo "Running full evaluation on sweep results..."
+python results/evaluate.py --results-dir results/depth_sweep_inference_only/
+
+echo ""
+echo "=== Sweep summary (BLEU | ROUGE-1 | METEOR | BERTScore) ==="
 python3 - <<'PYEOF'
-import pandas as pd, numpy as np, re, os
-from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
-from nltk.translate.meteor_score import single_meteor_score
-from rouge import Rouge
-from nltk.tokenize import word_tokenize
-import nltk
-nltk.download("punkt", quiet=True)
-nltk.download("wordnet", quiet=True)
-nltk.download("punkt_tab", quiet=True)
+import pandas as pd
 
-SWEEP_DIR = "results/depth_sweep_inference_only"
-
-def clean_text(text):
-    cleaned = re.sub(r"[^a-zA-Z0-9.,!?;:'\"()\[\]{}\-\s]", "", text)
-    lines = re.split(r"(?<=[.!?]) +", cleaned)
-    seen, unique = set(), []
-    for line in lines:
-        line = re.sub(r"\s+", " ", line).strip()
-        if line not in seen:
-            seen.add(line); unique.append(line)
-    return " ".join(unique[:1])
-
-def prep(df):
-    refs = df["Expected Caption"].tolist()
-    cands = []
-    for c in df["Generated Caption"].fillna("").tolist():
-        cl = clean_text(c) if c.strip() else ""
-        cands.append(cl if cl.strip() else "No response.")
-    return refs, ["No response" if len(c) <= 1 else c for c in cands]
-
-def score(refs, cands):
-    sf = SmoothingFunction().method4
-    r = [[x.split()] for x in refs]; c = [x.split() for x in cands]
-    bleu1 = round(np.mean([corpus_bleu([ri],[ci],smoothing_function=sf,weights=(1,0,0,0)) for ri,ci in zip(r,c)]),3)
-    rouge = Rouge()
-    sc = [rouge.get_scores(ci,ri,avg=True) for ri,ci in zip(refs,cands)]
-    r1 = round(np.mean([s["rouge-1"]["f"] for s in sc]),3)
-    tok_c = [word_tokenize(c.replace("<s>","").replace("</s>","").strip()) for c in cands]
-    tok_r = [word_tokenize(r) for r in refs]
-    meteor = round(sum(single_meteor_score(r,c) for r,c in zip(tok_r,tok_c))/len(tok_r),3)
-    return bleu1, r1, meteor
-
-rows = {}
-for fname in sorted(os.listdir(SWEEP_DIR)):
-    if not fname.endswith(".csv") or fname == "sweep_summary.csv": continue
-    df = pd.read_csv(os.path.join(SWEEP_DIR, fname))
-    refs, cands = prep(df)
-    b1, r1, m = score(refs, cands)
-    rows[fname.replace(".csv","")] = {"BLEU-1": b1, "ROUGE-1": r1, "METEOR": m}
-
-summary = pd.DataFrame(rows).T.sort_index()
-print("\n=== Updated Depth Sweep (inference-only) ===\n")
-print(summary.to_string())
-print("\n→ Lowest degradation = best candidate for full retrain")
+df = pd.read_csv("results/depth_sweep_inference_only/all_results.csv", index_col=0)
+cols = ["Mean BLEU Score", "Mean ROUGE-1", "Mean ROUGE-2", "Mean ROUGE-l",
+        "Mean Meteor Score", "Mean BERTScore", "Object Accuracy"]
+available = [c for c in cols if c in df.columns]
+print(df[available].sort_index().to_string())
+print("\n→ Lowest degradation from layer_0 = best candidate for full retrain")
 PYEOF

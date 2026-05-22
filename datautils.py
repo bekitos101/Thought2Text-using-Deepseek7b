@@ -115,13 +115,15 @@ class EEGFineTuningDataset:
         args,
         tokenizer_path=None,
         max_len=512,
+        load_processor=True,
     ):
-        
+
         self.args = args
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
         self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
         self.tokenizer.padding_side = "left"
         self.max_len = max_len
+        self.load_processor = load_processor
         # --- original hardcoded template (kept for reference) ---
         # if "gemma" in tokenizer_path.lower():
         #     self.messages = [
@@ -155,8 +157,11 @@ class EEGFineTuningDataset:
         self.image_dir = args.image_dir
         self.id2label = {}
 
-        # Initialize image processor
-        self.processor = AutoProcessor.from_pretrained(args.clip_model)
+        # Initialize image processor — skipped when only EEG (Stage 3) data is needed
+        if self.load_processor:
+            self.processor = AutoProcessor.from_pretrained(args.clip_model)
+        else:
+            self.processor = None
 
     # Get size
     def __len__(self):
@@ -212,10 +217,12 @@ class EEGFineTuningDataset:
         input_ids1 = input_ids1.squeeze(0)
         input_ids2 = input_ids2.squeeze(0)
 
-        image_raw = Image.open(image_path).convert("RGB")
-
-        image_raw = self.processor(images=image_raw, return_tensors="pt", padding=True)
-        image_raw["pixel_values"] = image_raw["pixel_values"].squeeze(0)
+        if self.processor is not None:
+            image_raw = Image.open(image_path).convert("RGB")
+            image_raw = self.processor(images=image_raw, return_tensors="pt", padding=True)
+            image_raw["pixel_values"] = image_raw["pixel_values"].squeeze(0)
+        else:
+            image_raw = {"pixel_values": torch.zeros(3, 224, 224)}
 
         return image_raw, eeg, input_ids1, input_ids2, label_string
 

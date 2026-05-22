@@ -65,6 +65,24 @@ def set_gradients(module, requires_grad):
         param.requires_grad = requires_grad
 
 
+def load_pretrained_projector(model, saved_pretrained_model_path, llm_backbone_name_or_path):
+    """Warm-start mm_proj from a previously saved projector.pth.
+
+    Used when --no_stage2 is set so the projector inherits its Stage-2
+    initialisation from an earlier run rather than starting from random weights.
+    Returns True if weights were loaded, False if no checkpoint was found.
+    """
+    llm_name = llm_backbone_name_or_path.split("/")[1]
+    projector_path = os.path.join(saved_pretrained_model_path, llm_name, "projector.pth")
+    if not os.path.exists(projector_path):
+        logger.warning(f"No pretrained projector found at {projector_path}, starting from random init.")
+        return False
+    proj_state = torch.load(projector_path, map_location="cpu")
+    model.mm_proj.load_state_dict(proj_state)
+    logger.info(f"Warm-started mm_proj from {projector_path}")
+    return True
+
+
 class Stage2Trainer(Trainer):
     def __init__(self, clip_model=None, data_loaders=None, tokenizer=None, **kwargs):
         super().__init__(**kwargs)
@@ -173,10 +191,14 @@ def main():
     set_gradients(module=model.eeg_encoder, requires_grad=False)
     set_gradients(module=model.llm, requires_grad=False)
 
+    if args.no_stage2 and args.saved_pretrained_model_path != "/tmp":
+        load_pretrained_projector(model, args.saved_pretrained_model_path, args.llm_backbone_name_or_path)
+
     dataset = EEGFineTuningDataset(
-        args=args, tokenizer_path=args.llm_backbone_name_or_path
+        args=args, tokenizer_path=args.llm_backbone_name_or_path,
+        load_processor=not args.no_stage2,
     )
-    
+
     if not args.no_stage2:
         logger.info("STAGE 2: LLM fine tuning on images")
         llm_name = args.llm_backbone_name_or_path.split("/")[1]
