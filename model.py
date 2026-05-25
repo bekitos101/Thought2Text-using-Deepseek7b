@@ -151,7 +151,8 @@ class EEGModelForCausalLM(PreTrainedModel):
             p = T - e1 - e2
             text_embeds[i, p:p+e1] = backbone.embed_tokens(input_ids1[i, -e1:])
             text_embeds[i, p+e1:T] = backbone.embed_tokens(input_ids2[i, -e2:])
-            text_labels[i, p:p+e1] = input_ids1[i, -e1:]
+            # Prompt positions (input_ids1) stay IGNORE_INDEX: they don't attend
+            # to EEG (causal mask), so their loss produces zero gradient to mm_proj.
             text_labels[i, p+e1:T] = input_ids2[i, -e2:]
 
         pos_ids_1 = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
@@ -197,9 +198,23 @@ class EEGModelForCausalLM(PreTrainedModel):
         attn2 = _causal_pad_mask(T_full, pad_starts)
 
         # ── Stage 2: full sequence through layers L..N-1 ────────────────────
-        for layer in layers[injection_layer:]:
-            hidden = layer(hidden, attention_mask=attn2,
-                           position_ids=pos_ids_2, use_cache=False)[0]
+        # Gradient checkpointing: HuggingFace enables it on backbone.layers but
+        # _deepinsert_forward calls layers directly, bypassing the model's own
+        # forward(). Re-apply checkpointing here so memory savings aren't lost.
+        use_gc = self.training and getattr(backbone, 'gradient_checkpointing', False)
+        if use_gc:
+            def _make_ckpt_fn(lyr):
+                def fn(h, mask, pos):
+                    return lyr(h, attention_mask=mask, position_ids=pos, use_cache=False)[0]
+                return fn
+            for layer in layers[injection_layer:]:
+                hidden = torch.utils.checkpoint.checkpoint(
+                    _make_ckpt_fn(layer), hidden, attn2, pos_ids_2, use_reentrant=False
+                )
+        else:
+            for layer in layers[injection_layer:]:
+                hidden = layer(hidden, attention_mask=attn2,
+                               position_ids=pos_ids_2, use_cache=False)[0]
 
         target_dtype = self.llm.lm_head.weight.dtype
         logits = self.llm.lm_head(backbone.norm(hidden.to(target_dtype)))
@@ -558,13 +573,7 @@ class EEGModelForCausalLM(PreTrainedModel):
             ] = input_embeds2[i, -effective_length2:, :]
 
             attention_masks[i, start_idx:] = 1
-            labels[
-                i, start_idx: start_idx + effective_length1
-            ] = input_ids1[i, -effective_length1:]
-            
-            # labels[i, start_idx+ effective_length1 : start_idx + effective_length1+ mm_seq_len] = IGNORE_INDEX
-            
-
+            # Prompt and mm_embed positions stay IGNORE_INDEX — response tokens only.
             labels[i, start_idx + effective_length1 + mm_seq_len : final_max_length] = (
                 input_ids2[i, -effective_length2:]
             )

@@ -267,14 +267,11 @@ class Filter:
 
             eeg = eeg.to(device)
             with torch.no_grad():
-                # original path: always needed for cls_logits to filter valid samples
-                mm_embeds_pooled, cls_logits = eeg_encoder(eeg)
-
                 if token_inject:
-                    # temporal token path: (B, 10, 50) — used for mid-layer injection
-                    mm_embeds = eeg_encoder(eeg, return_tokens=True)
+                    # Single forward: returns (B,10,50) tokens and cls_logits together.
+                    mm_embeds, cls_logits = eeg_encoder(eeg, return_tokens=True, return_cls=True)
                 else:
-                    mm_embeds = mm_embeds_pooled
+                    mm_embeds, cls_logits = eeg_encoder(eeg)
 
             obj_labels = F.softmax(cls_logits, dim=1).argmax(dim=1)
             for i, ls in enumerate(label_string):

@@ -54,3 +54,5 @@ Thumbs.db
 get-pip.py
 *.tmp
 *.bak
+SESSION_NOTES.md
+.gitignore

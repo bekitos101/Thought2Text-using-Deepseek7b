@@ -84,12 +84,13 @@ def load_pretrained_projector(model, saved_pretrained_model_path, llm_backbone_n
 
 
 class Stage2Trainer(Trainer):
-    def __init__(self, clip_model=None, data_loaders=None, tokenizer=None, **kwargs):
+    def __init__(self, clip_model=None, data_loaders=None, tokenizer=None, injection_layer=0, **kwargs):
         super().__init__(**kwargs)
         self.clip_model = clip_model
         self.data_loaders = data_loaders
         self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
         self.tokenizer = tokenizer
+        self.injection_layer = injection_layer
 
     def compute_loss(self, model, inputs, return_outputs=False):
         (
@@ -101,11 +102,10 @@ class Stage2Trainer(Trainer):
         ) = inputs
         pixels = img_data["pixel_values"].to(self.device)
         image_embeddings = self.clip_model(pixels).image_embeds
-        #image_embeddings = image_embeddings.to(self.device)
         output, labels = model(
-            input_ids1=input_ids1, input_ids2=input_ids2, mm_embeds=image_embeddings
+            input_ids1=input_ids1, input_ids2=input_ids2, mm_embeds=image_embeddings,
+            injection_layer=self.injection_layer,
         )
-        # print("Labels", self.tokenizer.batch_decode(labels))
         return (output.loss, output) if return_outputs else output.loss
 
     def get_train_dataloader(self):
@@ -141,6 +141,18 @@ class Stage3Trainer(Trainer):
         )
         # print("Labels", self.tokenizer.batch_decode(labels))
         return (output.loss, output) if return_outputs else output.loss
+
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        eeg_data, input_ids1, input_ids2 = inputs
+        eeg_data   = eeg_data.to(self.device)
+        input_ids1 = input_ids1.to(self.device)
+        input_ids2 = input_ids2.to(self.device)
+        with torch.no_grad():
+            output, _ = model(
+                input_ids1=input_ids1, input_ids2=input_ids2, mm_embeds=eeg_data,
+                injection_layer=self.injection_layer,
+            )
+        return (output.loss.detach(), None, None)
 
     def get_train_dataloader(self):
         return self.data_loaders["train"]
@@ -205,7 +217,7 @@ def main():
         pretrained_path = os.path.join(args.saved_pretrained_model_path, llm_name)
         
         if os.path.exists(pretrained_path) and os.path.isdir(pretrained_path):
-            print(f"Stage 3 trained model already available. Loadig model from {pretrained_path}. Skipping retraining")
+            print(f"Stage 2 trained model already available. Loading model from {pretrained_path}. Skipping stage 2.")
             del model
             gc.collect()
             torch.cuda.empty_cache()
@@ -278,6 +290,7 @@ def main():
                     data_loaders=loaders,
                     clip_model=clip_model,
                     tokenizer=img_dataset.tokenizer,
+                    injection_layer=args.injection_layer,
                 )
             else:
                 loaders = {
@@ -303,11 +316,14 @@ def main():
                     data_loaders=loaders,
                     clip_model=clip_model,
                     tokenizer=dataset.tokenizer,
+                    injection_layer=args.injection_layer,
                 )
             trainer.train()
             model.save_pretrained(pretrained_path)
             model.llm.save_pretrained(os.path.join(pretrained_path, "llm"))
             dataset.tokenizer.save_pretrained(pretrained_path)
+            with open(os.path.join(pretrained_path, "eeg_config.json"), "w") as f:
+                json.dump({"token_inject": args.token_inject, "injection_layer": args.injection_layer}, f)
 
             del clip_model
             del loaders
@@ -353,6 +369,11 @@ def main():
         group_by_length=args.group_by_length,
         lr_scheduler_type=args.lr_scheduler_type,
         report_to="tensorboard",
+        evaluation_strategy="epoch",
+        save_strategy="epoch",
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
     )
 
     trainer = Stage3Trainer(
